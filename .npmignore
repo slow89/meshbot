@@ -1,0 +1,9 @@
+src/
+bin/
+tests/
+tsconfig.json
+eslint.config.js
+.github/
+.gitignore
+*.tgz
+coverage/

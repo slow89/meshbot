@@ -1,0 +1,64 @@
+{
+  "name": "meshbot",
+  "version": "0.1.0",
+  "description": "Lightweight networking layer for Claude Code — lets named agent instances on different servers communicate securely via HTTPS + pre-shared keys",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "meshbot": "./dist/bin/meshbot.js",
+    "mesh": "./dist/bin/meshbot.js",
+    "bot": "./dist/bin/meshbot.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "packageManager": "pnpm@10.6.2",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/slow89/meshbot.git"
+  },
+  "homepage": "https://github.com/slow89/meshbot",
+  "bugs": {
+    "url": "https://github.com/slow89/meshbot/issues"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "agent",
+    "mesh",
+    "multi-agent",
+    "networking",
+    "mcp",
+    "anthropic"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/bin/meshbot.js && mkdir -p dist/src/hooks && cp src/hooks/*.sh dist/src/hooks/ && chmod +x dist/src/hooks/*.sh",
+    "dev": "tsx bin/meshbot.ts",
+    "lint": "eslint src/ bin/ tests/",
+    "lint:fix": "eslint src/ bin/ tests/ --fix",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "commander": "^13.1.0",
+    "express": "^5.0.1",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.2",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.4",
+    "eslint": "^9.39.2",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.55.0",
+    "vitest": "^3.0.5"
+  }
+}
