@@ -118,11 +118,12 @@ meshbot invite create --mesh my-mesh --agent qa-bot --node-pubkey <node-pubkey> 
 
 ```bash
 # On the NEW host: join from any running seed peer
-meshbot join --mesh my-mesh --as qa-bot --seed https://prod.internal:9820 --invite <token> --root-pub ./my-mesh-root.pub
+meshbot join --mesh my-mesh --as qa-bot --invite <token> --root-pub ./my-mesh-root.pub
 meshbot start --as qa-bot --port 9822 --mesh my-mesh
 ```
 
 `--root-pub` should point to a trusted copy of the mesh root public key (`root.pub`).
+`meshbot join` uses seed hints from the invite token by default; pass `--seed <url>` to override.
 
 ```bash
 # Existing hosts can pull newer signed manifest versions
@@ -228,8 +229,8 @@ meshbot init <mesh-name>                          # Create mesh + key + bootstra
 meshbot init <mesh-name> --legacy                 # Create only config + mesh.key
 meshbot init <mesh-name> --no-bootstrap           # Alias for --legacy
 meshbot join-prepare [-m <mesh-name>]             # Generate node enrollment keypair
-meshbot invite create --agent <name> --node-pubkey <base64> [-m <mesh-name>] [--ttl 15m]
-meshbot join --as <name> --seed <url> --invite <token> --root-pub <path> [-m <mesh-name>]
+meshbot invite create --agent <name> --node-pubkey <base64> [-m <mesh-name>] [--ttl 15m] [--seed <url>...]
+meshbot join --as <name> --invite <token> --root-pub <path> [-m <mesh-name>] [--seed <url>]
 meshbot sync --seed <url> [-m <mesh-name>]        # Pull newer signed manifest/config
 meshbot add-peer <name> <url> [-d "description"]  # Add peer
 meshbot remove-peer <name>                        # Remove peer

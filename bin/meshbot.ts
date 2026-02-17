@@ -38,8 +38,12 @@ import {
   setupBootstrapArtifacts,
   updateSignedManifest,
 } from "../src/bootstrap/setup.js";
-import { createInviteToken, parseDurationToMs } from "../src/bootstrap/invite.js";
-import type { ManifestPayload } from "../src/config/types.js";
+import {
+  createInviteToken,
+  parseDurationToMs,
+  verifyInviteToken,
+} from "../src/bootstrap/invite.js";
+import type { InviteTokenPayload, ManifestPayload } from "../src/config/types.js";
 import {
   parseEnvelopePayload,
   verifyEnvelopeEd25519,
@@ -242,25 +246,44 @@ inviteCommand
   .requiredOption("--agent <name>", "Agent name this invite is for")
   .requiredOption("--node-pubkey <base64>", "Node public key from `meshbot join-prepare`")
   .option("-m, --mesh <meshName>", "Mesh name", "default")
+  .option("--seed <urls...>", "Optional seed URL hints embedded in the invite token")
   .option("--ttl <duration>", "Invite validity (e.g. 15m, 2h)", "15m")
-  .action((opts: { agent: string; nodePubkey: string; mesh: string; ttl: string }) => {
+  .action((opts: { agent: string; nodePubkey: string; mesh: string; ttl: string; seed?: string[] }) => {
     const rootPrivateKey = loadRootPrivateKey(opts.mesh);
     const ttlMs = parseDurationToMs(opts.ttl);
     const now = Date.now();
+    const config = loadConfig(opts.mesh);
+    const seedHints = (opts.seed && opts.seed.length > 0)
+      ? opts.seed
+      : Object.values(config.peers).map((peer) => peer.url).slice(0, 5);
 
-    const token = createInviteToken(
-      {
-        v: 1,
-        mesh: opts.mesh,
-        agent: opts.agent,
-        nodePubKey: opts.nodePubkey,
-        jti: crypto.randomUUID(),
-        iat: now,
-        nbf: now,
-        exp: now + ttlMs,
-      },
-      rootPrivateKey
-    );
+    let minManifestVersion: number | undefined;
+    try {
+      const manifest = loadManifest(opts.mesh);
+      const payload = parseEnvelopePayload(manifest) as ManifestPayload;
+      minManifestVersion = payload.version;
+    } catch {
+      minManifestVersion = undefined;
+    }
+
+    const invitePayload: InviteTokenPayload = {
+      v: 1,
+      mesh: opts.mesh,
+      agent: opts.agent,
+      nodePubKey: opts.nodePubkey,
+      jti: crypto.randomUUID(),
+      iat: now,
+      nbf: now,
+      exp: now + ttlMs,
+    };
+    if (seedHints.length > 0) {
+      invitePayload.seedHints = seedHints;
+    }
+    if (minManifestVersion !== undefined) {
+      invitePayload.minManifestVersion = minManifestVersion;
+    }
+
+    const token = createInviteToken(invitePayload, rootPrivateKey);
 
     console.log(token);
   });
@@ -270,14 +293,14 @@ program
   .command("join")
   .description("Join a mesh by fetching a signed manifest from a seed peer")
   .requiredOption("--as <name>", "Agent name for this host")
-  .requiredOption("--seed <url>", "Bootstrap seed peer URL, e.g. https://prod.internal:9820")
+  .option("--seed <url>", "Bootstrap seed peer URL (optional if invite includes seed hints)")
   .requiredOption("--invite <token>", "Invite token from `meshbot invite create`")
   .requiredOption("--root-pub <path>", "Path to root public key PEM")
   .option("-m, --mesh <meshName>", "Mesh name", "default")
   .action(
     async (opts: {
       as: string;
-      seed: string;
+      seed?: string;
       invite: string;
       rootPub: string;
       mesh: string;
@@ -285,12 +308,48 @@ program
       try {
         const nodePubKey = loadNodePublicKey(opts.mesh);
         const rootPublicKeyPem = fs.readFileSync(opts.rootPub, "utf-8").trim();
+        const inviteVerification = verifyInviteToken(opts.invite, rootPublicKeyPem);
+        if (!inviteVerification.ok || !inviteVerification.payload) {
+          throw new Error(`Invalid invite token: ${inviteVerification.error ?? "verification failed"}`);
+        }
+        if (inviteVerification.payload.mesh !== opts.mesh) {
+          throw new Error(
+            `Invite mesh mismatch: expected "${opts.mesh}" got "${inviteVerification.payload.mesh}"`
+          );
+        }
 
-        const joinResponse = await joinMeshBootstrap(
-          opts.seed,
-          opts.invite,
-          nodePubKey
-        );
+        const seedCandidates = opts.seed
+          ? [opts.seed]
+          : (inviteVerification.payload.seedHints ?? []);
+        if (seedCandidates.length === 0) {
+          throw new Error(
+            "No seed URL provided. Pass --seed or create an invite with seed hints."
+          );
+        }
+
+        let joinResponse: Awaited<ReturnType<typeof joinMeshBootstrap>> | undefined;
+        let selectedSeed: string | undefined;
+        const joinErrors: string[] = [];
+        for (const candidate of seedCandidates) {
+          try {
+            joinResponse = await joinMeshBootstrap(
+              candidate,
+              opts.invite,
+              nodePubKey
+            );
+            selectedSeed = candidate;
+            break;
+          } catch (err) {
+            joinErrors.push(`${candidate}: ${String(err)}`);
+          }
+        }
+
+        if (!joinResponse || !selectedSeed) {
+          throw new Error(`Failed to join using all seed candidates. ${joinErrors.join(" | ")}`);
+        }
+        if (!opts.seed) {
+          console.log(`Using seed from invite token: ${selectedSeed}`);
+        }
         const manifestEnvelope = joinResponse.manifest;
 
         const verified = verifyEnvelopeEd25519(manifestEnvelope, rootPublicKeyPem);
@@ -315,7 +374,7 @@ program
         saveMeshKey(opts.mesh, manifestPayload.transport.meshKey);
         saveConfig(manifestToConfig(manifestPayload));
 
-        console.log(`Joined mesh "${opts.mesh}" from seed ${opts.seed}.`);
+        console.log(`Joined mesh "${opts.mesh}" from seed ${selectedSeed}.`);
         console.log(`Manifest version: ${String(manifestPayload.version)}`);
         console.log(`Saved config: ~/.mesh/${opts.mesh}/config.json`);
         console.log(`Saved key:    ~/.mesh/${opts.mesh}/mesh.key`);
