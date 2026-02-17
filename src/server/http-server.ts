@@ -9,6 +9,7 @@ import type { TlsConfig } from "../config/types.js";
 
 export interface HttpServerOptions {
   agentName: string;
+  meshName?: string;
   port: number;
   host: string;
   meshKey: string;
@@ -53,6 +54,7 @@ export async function startHttpServer(
   const routes = createRoutes(
     options.agentName,
     options.queue,
+    options.meshName ? { meshName: options.meshName } : undefined,
     options.onAskReceived,
     options.onMessageReceived
   );
@@ -62,6 +64,10 @@ export async function startHttpServer(
     "/mesh",
     (req, res, next) => {
       if (req.path === "/health" && req.method === "GET") {
+        next();
+        return;
+      }
+      if (req.path === "/bootstrap/join" && req.method === "POST") {
         next();
         return;
       }

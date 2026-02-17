@@ -1,13 +1,18 @@
 import { describe, it, expect } from "vitest";
-import { generateMeshKey } from "../src/security/keys.js";
+import { generateMeshKey, generateSigningKeyPair } from "../src/security/keys.js";
 import {
   signMessage,
   verifyHmac,
   isTimestampValid,
   NonceTracker,
   generateNonce,
+  canonicalizeJson,
+  signEnvelopeEd25519,
+  verifyEnvelopeEd25519,
+  parseEnvelopePayload,
   type SignableMessage,
 } from "../src/security/signing.js";
+import type { ManifestPayload } from "../src/config/types.js";
 
 describe("key generation", () => {
   it("generates a 256-bit base64 key", () => {
@@ -124,5 +129,49 @@ describe("nonce generation", () => {
     const a = generateNonce();
     const b = generateNonce();
     expect(a).not.toBe(b);
+  });
+});
+
+describe("manifest signing", () => {
+  it("creates a deterministic canonical JSON representation", () => {
+    const a = canonicalizeJson({ b: 2, a: 1, c: { y: 2, x: 1 } });
+    const b = canonicalizeJson({ c: { x: 1, y: 2 }, a: 1, b: 2 });
+    expect(a).toBe(b);
+  });
+
+  it("signs and verifies a manifest envelope", () => {
+    const { privateKeyPem, publicKeyPem } = generateSigningKeyPair();
+    const payload: ManifestPayload = {
+      v: 1,
+      mesh: "test-mesh",
+      version: 1,
+      issuedAt: "2026-02-17T00:00:00.000Z",
+      security: {
+        replayWindowSeconds: 60,
+        maxMessageSizeBytes: 1_048_576,
+      },
+      transport: { meshKey: generateMeshKey() },
+      agents: {
+        dev: { url: "https://dev.example.com:9820" },
+      },
+      revocations: {
+        inviteJti: [],
+        agents: [],
+      },
+    };
+
+    const envelope = signEnvelopeEd25519(payload, privateKeyPem, "root-2026-02-17");
+    expect(verifyEnvelopeEd25519(envelope, publicKeyPem)).toBe(true);
+
+    const decoded = parseEnvelopePayload(envelope) as ManifestPayload;
+    expect(decoded.mesh).toBe(payload.mesh);
+    expect(decoded.agents["dev"]?.url).toBe("https://dev.example.com:9820");
+  });
+
+  it("rejects verification with a different public key", () => {
+    const signer = generateSigningKeyPair();
+    const other = generateSigningKeyPair();
+    const envelope = signEnvelopeEd25519({ ok: true }, signer.privateKeyPem, "root-kid");
+    expect(verifyEnvelopeEd25519(envelope, other.publicKeyPem)).toBe(false);
   });
 });

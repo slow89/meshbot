@@ -1,9 +1,20 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import * as fs from "node:fs";
 import { startHttpServer, type HttpServer } from "../src/server/http-server.js";
 import { MessageQueue } from "../src/queue/message-queue.js";
 import { generateMeshKey } from "../src/security/keys.js";
 import { signMessage, generateNonce } from "../src/security/signing.js";
 import type { MeshMessage } from "../src/queue/message-queue.js";
+import {
+  createDefaultConfig,
+  getAdminMeshDir,
+  getMeshDir,
+  loadRootPrivateKey,
+  saveConfig,
+  saveMeshKey,
+} from "../src/config/loader.js";
+import { setupBootstrapArtifacts } from "../src/bootstrap/setup.js";
+import { createInviteToken } from "../src/bootstrap/invite.js";
 
 describe("HTTP server", () => {
   let server: HttpServer;
@@ -194,5 +205,134 @@ describe("HTTP server", () => {
     const queued = queue.drain();
     expect(queued.length).toBe(1);
     expect(queued[0]!.type).toBe("ask");
+  });
+});
+
+describe("HTTP bootstrap routes", () => {
+  let server: HttpServer;
+  let queue: MessageQueue;
+  let baseUrl: string;
+  let meshKey: string;
+  let meshName: string;
+  let inviteToken: string;
+  const nodePubKey = "test-node-public-key";
+
+  beforeAll(async () => {
+    meshName = `bootstrap-routes-${Date.now()}`;
+    meshKey = generateMeshKey();
+
+    saveMeshKey(meshName, meshKey);
+    const config = createDefaultConfig(meshName);
+    saveConfig(config);
+    setupBootstrapArtifacts(config, meshKey);
+
+    const rootPrivateKey = loadRootPrivateKey(meshName);
+    const now = Date.now();
+    inviteToken = createInviteToken(
+      {
+        v: 1,
+        mesh: meshName,
+        agent: "new-agent",
+        nodePubKey,
+        jti: crypto.randomUUID(),
+        iat: now,
+        nbf: now,
+        exp: now + 5 * 60 * 1000,
+      },
+      rootPrivateKey
+    );
+
+    queue = new MessageQueue();
+    server = await startHttpServer({
+      agentName: "seed-agent",
+      meshName,
+      port: 0,
+      host: "127.0.0.1",
+      meshKey,
+      queue,
+      replayWindowSeconds: 60,
+      maxMessageSizeBytes: 1_048_576,
+      dev: true,
+    });
+    baseUrl = `http://127.0.0.1:${server.port}`;
+  });
+
+  afterAll(async () => {
+    queue.destroy();
+    await server.close();
+
+    const meshDir = getMeshDir(meshName);
+    const adminDir = getAdminMeshDir(meshName);
+    if (fs.existsSync(meshDir)) {
+      fs.rmSync(meshDir, { recursive: true });
+    }
+    if (fs.existsSync(adminDir)) {
+      fs.rmSync(adminDir, { recursive: true });
+    }
+  });
+
+  it("allows unauthenticated bootstrap join with a valid invite", async () => {
+    const response = await fetch(`${baseUrl}/mesh/bootstrap/join`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        token: inviteToken,
+        nodePubKey,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const data = (await response.json()) as {
+      ok: boolean;
+      mesh: string;
+      manifest: { alg: string };
+    };
+    expect(data.ok).toBe(true);
+    expect(data.mesh).toBe(meshName);
+    expect(data.manifest.alg).toBe("Ed25519");
+  });
+
+  it("rejects join with mismatched node key", async () => {
+    const response = await fetch(`${baseUrl}/mesh/bootstrap/join`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        token: inviteToken,
+        nodePubKey: "wrong-node-key",
+      }),
+    });
+
+    expect(response.status).toBe(403);
+  });
+
+  it("requires auth for bootstrap head", async () => {
+    const unauth = await fetch(`${baseUrl}/mesh/bootstrap/head`);
+    expect(unauth.status).toBe(401);
+
+    const auth = await fetch(`${baseUrl}/mesh/bootstrap/head`, {
+      headers: {
+        Authorization: `Bearer ${meshKey}`,
+      },
+    });
+    expect(auth.status).toBe(200);
+    const data = (await auth.json()) as { version: number; mesh: string };
+    expect(data.mesh).toBe(meshName);
+    expect(data.version).toBe(1);
+  });
+
+  it("serves latest manifest via authenticated endpoint", async () => {
+    const response = await fetch(`${baseUrl}/mesh/bootstrap/manifest/latest`, {
+      headers: {
+        Authorization: `Bearer ${meshKey}`,
+      },
+    });
+    expect(response.status).toBe(200);
+    const data = (await response.json()) as { alg: string; payload: string };
+    expect(data.alg).toBe("Ed25519");
+    expect(typeof data.payload).toBe("string");
   });
 });

@@ -95,17 +95,38 @@ meshbot start --as prod-ops --daemon
 
 ### Multi-Server Setup
 
-For agents on different servers, use `add-peer` to register remote agents with their external URLs, then copy the mesh config + key:
+For agents on different servers, you can now bootstrap a new host without copying `~/.mesh/<mesh>/`.
 
 ```bash
-# On any machine: create the mesh and pre-register remote agents
+# On an existing mesh/admin host: initialize and register peer URLs
 meshbot init my-mesh
 meshbot add-peer prod-ops https://prod.internal:9820 -m my-mesh -d "Production monitoring"
 meshbot add-peer dev      https://dev.internal:9821  -m my-mesh -d "Development agent"
+```
 
-# Copy the mesh config + key to each server
-scp -r ~/.mesh/my-mesh/ user@prod.internal:~/.mesh/my-mesh/
-scp -r ~/.mesh/my-mesh/ user@dev.internal:~/.mesh/my-mesh/
+```bash
+# On the NEW host (e.g. qa-bot host): generate enrollment keypair
+meshbot join-prepare --mesh my-mesh
+# Copy printed node pubkey value to admin host
+```
+
+```bash
+# Back on admin host: create short-lived invite for that node key
+meshbot invite create --mesh my-mesh --agent qa-bot --node-pubkey <node-pubkey> --ttl 15m
+# Copy token to new host
+```
+
+```bash
+# On the NEW host: join from any running seed peer
+meshbot join --mesh my-mesh --as qa-bot --seed https://prod.internal:9820 --invite <token> --root-pub ./my-mesh-root.pub
+meshbot start --as qa-bot --port 9822 --mesh my-mesh
+```
+
+`--root-pub` should point to a trusted copy of the mesh root public key (`root.pub`).
+
+```bash
+# Existing hosts can pull newer signed manifest versions
+meshbot sync --mesh my-mesh --seed https://prod.internal:9820
 ```
 
 ```bash
@@ -203,7 +224,13 @@ claude
 ### Mesh Management
 
 ```bash
-meshbot init <mesh-name>                          # Create mesh + generate key
+meshbot init <mesh-name>                          # Create mesh + key + bootstrap artifacts
+meshbot init <mesh-name> --legacy                 # Create only config + mesh.key
+meshbot init <mesh-name> --no-bootstrap           # Alias for --legacy
+meshbot join-prepare [-m <mesh-name>]             # Generate node enrollment keypair
+meshbot invite create --agent <name> --node-pubkey <base64> [-m <mesh-name>] [--ttl 15m]
+meshbot join --as <name> --seed <url> --invite <token> --root-pub <path> [-m <mesh-name>]
+meshbot sync --seed <url> [-m <mesh-name>]        # Pull newer signed manifest/config
 meshbot add-peer <name> <url> [-d "description"]  # Add peer
 meshbot remove-peer <name>                        # Remove peer
 meshbot status                                    # Show all peers (online/offline)
@@ -231,10 +258,11 @@ These tools are automatically available to Claude inside a mesh agent session:
 ```bash
 meshbot init my-mesh
 # Creates ~/.mesh/my-mesh/mesh.key (256-bit random, base64)
-# Share this key with all servers in the mesh
+# Also creates ~/.mesh/my-mesh/root.pub + ~/.mesh/my-mesh/manifest.json
+# Root private signing key is stored at ~/.mesh-admin/my-mesh/root.key
 ```
 
-All agents in a mesh share the same key. To add a server, copy the `~/.mesh/<name>/` directory.
+All agents in a mesh share the same transport key today. New hosts can enroll via `join-prepare` + `invite create` + `join` instead of copying the mesh directory.
 
 ### Wire Security
 
@@ -261,7 +289,18 @@ Config lives in `~/.mesh/<mesh-name>/`:
 ```
 ~/.mesh/my-mesh/
 ├── config.json    # Peer list, TLS, security settings
-└── mesh.key       # Shared secret (mode 600)
+├── mesh.key       # Shared secret (mode 600)
+├── root.pub       # Root signing public key
+├── manifest.json  # Signed manifest snapshot
+├── node.pub       # Per-host enrollment public key (created by join-prepare)
+└── node.key       # Per-host enrollment private key (mode 600)
+```
+
+Admin-only signing material is stored separately:
+
+```
+~/.mesh-admin/my-mesh/
+└── root.key       # Root signing private key (mode 600)
 ```
 
 ### config.json
@@ -340,7 +379,7 @@ pnpm install
 pnpm run build       # Compile TypeScript
 pnpm run lint        # ESLint (strict)
 pnpm run typecheck   # tsc --noEmit
-pnpm test            # Vitest (46 tests)
+pnpm test            # Vitest
 pnpm run dev         # Run with tsx (no build step)
 ```
 
@@ -364,7 +403,10 @@ src/
     types.ts           TypeScript interfaces
   security/
     keys.ts            Key generation
-    signing.ts         HMAC + nonce + timestamp validation
+    signing.ts         HMAC + nonce + timestamp + manifest signing
+  bootstrap/
+    setup.ts           Bootstrap artifact generation + manifest helpers
+    invite.ts          Invite token signing and verification
 tests/                 Unit + integration tests
 ```
 

@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import type { MeshMessage } from "../queue/message-queue.js";
 import { signMessage, generateNonce } from "../security/signing.js";
+import type { BootstrapHead, SignedEnvelope } from "../config/types.js";
 
 export interface SendOptions {
   from: string;
@@ -103,4 +104,80 @@ export async function checkPeerHealth(
   } catch {
     return { online: false };
   }
+}
+
+export interface BootstrapJoinResponse {
+  ok: boolean;
+  mesh: string;
+  agent: string;
+  now: number;
+  manifest: SignedEnvelope;
+  sync: {
+    headUrl: string;
+    manifestUrlTemplate: string;
+    intervalSeconds: number;
+  };
+}
+
+function normalizeUrl(peerUrl: string): string {
+  return peerUrl.replace(/\/$/, "");
+}
+
+export async function joinMeshBootstrap(
+  peerUrl: string,
+  token: string,
+  nodePubKey: string
+): Promise<BootstrapJoinResponse> {
+  const url = `${normalizeUrl(peerUrl)}/mesh/bootstrap/join`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, nodePubKey }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Bootstrap join failed: ${String(response.status)} ${errorBody}`);
+  }
+
+  return (await response.json()) as BootstrapJoinResponse;
+}
+
+export async function fetchBootstrapHead(
+  peerUrl: string,
+  meshKey: string
+): Promise<BootstrapHead> {
+  const url = `${normalizeUrl(peerUrl)}/mesh/bootstrap/head`;
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${meshKey}`,
+    },
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Bootstrap head fetch failed: ${String(response.status)} ${errorBody}`);
+  }
+
+  return (await response.json()) as BootstrapHead;
+}
+
+export async function fetchBootstrapManifest(
+  peerUrl: string,
+  meshKey: string,
+  version: number | "latest"
+): Promise<SignedEnvelope> {
+  const url = `${normalizeUrl(peerUrl)}/mesh/bootstrap/manifest/${String(version)}`;
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${meshKey}`,
+    },
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Manifest fetch failed: ${String(response.status)} ${errorBody}`);
+  }
+
+  return (await response.json()) as SignedEnvelope;
 }

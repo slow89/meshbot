@@ -2,10 +2,12 @@
 
 import { Command } from "commander";
 import { execFileSync, spawn } from "node:child_process";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import * as crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { generateMeshKey } from "../src/security/keys.js";
+import { generateEnrollmentKeyPair, generateMeshKey } from "../src/security/keys.js";
 import {
   loadConfig,
   saveConfig,
@@ -15,8 +17,33 @@ import {
   createDefaultConfig,
   addPeer,
   removePeer,
+  loadRootPrivateKey,
+  saveRootPublicKey,
+  saveNodePrivateKey,
+  saveNodePublicKey,
+  loadNodePublicKey,
+  saveManifest,
+  loadManifest,
+  getRootPublicKeyPath,
 } from "../src/config/loader.js";
-import { checkPeerHealth, sendMeshMessage } from "../src/client/mesh-client.js";
+import {
+  checkPeerHealth,
+  sendMeshMessage,
+  joinMeshBootstrap,
+  fetchBootstrapHead,
+  fetchBootstrapManifest,
+} from "../src/client/mesh-client.js";
+import {
+  manifestToConfig,
+  setupBootstrapArtifacts,
+  updateSignedManifest,
+} from "../src/bootstrap/setup.js";
+import { createInviteToken, parseDurationToMs } from "../src/bootstrap/invite.js";
+import type { ManifestPayload } from "../src/config/types.js";
+import {
+  parseEnvelopePayload,
+  verifyEnvelopeEd25519,
+} from "../src/security/signing.js";
 
 const program = new Command();
 
@@ -25,11 +52,24 @@ program
   .description("Cross-server Claude Code agent communication")
   .version("0.1.0");
 
+function maybeUpdateManifestAfterConfigChange(meshName: string): void {
+  try {
+    const config = loadConfig(meshName);
+    const meshKey = loadMeshKey(meshName);
+    const result = updateSignedManifest(config, meshKey);
+    console.log(`Updated signed manifest: ${result.path} (v${String(result.version)})`);
+  } catch {
+    // Bootstrap artifacts are optional; legacy meshes may not have signing keys yet.
+  }
+}
+
 // ─── meshbot init <mesh-name> ───
 program
   .command("init <meshName>")
   .description("Create a new mesh and generate shared key")
-  .action((meshName: string) => {
+  .option("--legacy", "Create only config + mesh.key (disable bootstrap artifacts)")
+  .option("--no-bootstrap", "Disable bootstrap artifacts (alias for --legacy)")
+  .action((meshName: string, opts: { legacy: boolean; bootstrap: boolean }) => {
     if (meshExists(meshName)) {
       console.error(`Mesh "${meshName}" already exists.`);
       process.exit(1);
@@ -39,10 +79,23 @@ program
     saveMeshKey(meshName, key);
     const config = createDefaultConfig(meshName);
     saveConfig(config);
+    const bootstrapEnabled = !opts.legacy && opts.bootstrap;
 
     console.log(`Mesh "${meshName}" created.`);
     console.log(`Config: ~/.mesh/${meshName}/config.json`);
     console.log(`Key:    ~/.mesh/${meshName}/mesh.key`);
+    if (bootstrapEnabled) {
+      const bootstrap = setupBootstrapArtifacts(config, key);
+      console.log(`Root public key:  ${bootstrap.rootPublicKeyPath}`);
+      console.log(`Root private key: ${bootstrap.rootPrivateKeyPath}`);
+      console.log(`Manifest:         ${bootstrap.manifestPath} (v${String(bootstrap.manifestVersion)})`);
+      console.log(`Key ID:           ${bootstrap.kid}`);
+      console.log(
+        "\nBootstrap artifacts generated. Use signed manifests/invites to enroll remote hosts without copying config files."
+      );
+    } else {
+      console.log("\nBootstrap setup skipped (legacy mode).");
+    }
     console.log(
       `\nStart an agent: meshbot start --as <name> --mesh ${meshName}`
     );
@@ -61,6 +114,7 @@ program
     const config = loadConfig(opts.mesh);
     const updated = addPeer(config, name, url, opts.description);
     saveConfig(updated);
+    maybeUpdateManifestAfterConfigChange(opts.mesh);
     console.log(`Added peer "${name}" (${url}) to mesh "${opts.mesh}".`);
   });
 
@@ -77,6 +131,7 @@ program
     }
     const updated = removePeer(config, name);
     saveConfig(updated);
+    maybeUpdateManifestAfterConfigChange(opts.mesh);
     console.log(`Removed peer "${name}" from mesh "${opts.mesh}".`);
   });
 
@@ -158,6 +213,176 @@ program
   .action((opts: { mesh: string }) => {
     const key = loadMeshKey(opts.mesh);
     console.log(key);
+  });
+
+// ─── meshbot join-prepare ───
+program
+  .command("join-prepare")
+  .description("Generate per-host enrollment keys for bootstrap join")
+  .option("-m, --mesh <meshName>", "Mesh name", "default")
+  .action((opts: { mesh: string }) => {
+    const keyPair = generateEnrollmentKeyPair();
+    saveNodePublicKey(opts.mesh, keyPair.publicKey);
+    saveNodePrivateKey(opts.mesh, keyPair.privateKey);
+
+    console.log(`Generated node enrollment keys for mesh "${opts.mesh}".`);
+    console.log(`Public key:  ~/.mesh/${opts.mesh}/node.pub`);
+    console.log(`Private key: ~/.mesh/${opts.mesh}/node.key`);
+    console.log("\nGive this value to an admin for invite creation:");
+    console.log(keyPair.publicKey);
+  });
+
+const inviteCommand = program
+  .command("invite")
+  .description("Invite token utilities");
+
+inviteCommand
+  .command("create")
+  .description("Create a signed join invite token")
+  .requiredOption("--agent <name>", "Agent name this invite is for")
+  .requiredOption("--node-pubkey <base64>", "Node public key from `meshbot join-prepare`")
+  .option("-m, --mesh <meshName>", "Mesh name", "default")
+  .option("--ttl <duration>", "Invite validity (e.g. 15m, 2h)", "15m")
+  .action((opts: { agent: string; nodePubkey: string; mesh: string; ttl: string }) => {
+    const rootPrivateKey = loadRootPrivateKey(opts.mesh);
+    const ttlMs = parseDurationToMs(opts.ttl);
+    const now = Date.now();
+
+    const token = createInviteToken(
+      {
+        v: 1,
+        mesh: opts.mesh,
+        agent: opts.agent,
+        nodePubKey: opts.nodePubkey,
+        jti: crypto.randomUUID(),
+        iat: now,
+        nbf: now,
+        exp: now + ttlMs,
+      },
+      rootPrivateKey
+    );
+
+    console.log(token);
+  });
+
+// ─── meshbot join ───
+program
+  .command("join")
+  .description("Join a mesh by fetching a signed manifest from a seed peer")
+  .requiredOption("--as <name>", "Agent name for this host")
+  .requiredOption("--seed <url>", "Bootstrap seed peer URL, e.g. https://prod.internal:9820")
+  .requiredOption("--invite <token>", "Invite token from `meshbot invite create`")
+  .requiredOption("--root-pub <path>", "Path to root public key PEM")
+  .option("-m, --mesh <meshName>", "Mesh name", "default")
+  .action(
+    async (opts: {
+      as: string;
+      seed: string;
+      invite: string;
+      rootPub: string;
+      mesh: string;
+    }) => {
+      try {
+        const nodePubKey = loadNodePublicKey(opts.mesh);
+        const rootPublicKeyPem = fs.readFileSync(opts.rootPub, "utf-8").trim();
+
+        const joinResponse = await joinMeshBootstrap(
+          opts.seed,
+          opts.invite,
+          nodePubKey
+        );
+        const manifestEnvelope = joinResponse.manifest;
+
+        const verified = verifyEnvelopeEd25519(manifestEnvelope, rootPublicKeyPem);
+        if (!verified) {
+          throw new Error("Manifest signature verification failed");
+        }
+
+        const manifestPayload = parseEnvelopePayload(manifestEnvelope) as ManifestPayload;
+        if (manifestPayload.mesh !== opts.mesh) {
+          throw new Error(
+            `Manifest mesh mismatch: expected "${opts.mesh}" got "${manifestPayload.mesh}"`
+          );
+        }
+        if (!manifestPayload.agents[opts.as]) {
+          console.error(
+            `Warning: agent "${opts.as}" is not listed in manifest peers yet.`
+          );
+        }
+
+        saveRootPublicKey(opts.mesh, rootPublicKeyPem);
+        saveManifest(opts.mesh, manifestEnvelope);
+        saveMeshKey(opts.mesh, manifestPayload.transport.meshKey);
+        saveConfig(manifestToConfig(manifestPayload));
+
+        console.log(`Joined mesh "${opts.mesh}" from seed ${opts.seed}.`);
+        console.log(`Manifest version: ${String(manifestPayload.version)}`);
+        console.log(`Saved config: ~/.mesh/${opts.mesh}/config.json`);
+        console.log(`Saved key:    ~/.mesh/${opts.mesh}/mesh.key`);
+        console.log(`\nNext: meshbot start --as ${opts.as} --mesh ${opts.mesh}`);
+      } catch (err) {
+        console.error(`Join failed: ${String(err)}`);
+        process.exit(1);
+      }
+    }
+  );
+
+// ─── meshbot sync ───
+program
+  .command("sync")
+  .description("Sync signed manifest from a seed peer")
+  .requiredOption("--seed <url>", "Seed peer URL")
+  .option("-m, --mesh <meshName>", "Mesh name", "default")
+  .action(async (opts: { seed: string; mesh: string }) => {
+    try {
+      const meshKey = loadMeshKey(opts.mesh);
+      const rootPublicKey = fs.readFileSync(getRootPublicKeyPath(opts.mesh), "utf-8").trim();
+
+      const remoteHead = await fetchBootstrapHead(opts.seed, meshKey);
+
+      let localVersion = 0;
+      try {
+        const localManifest = loadManifest(opts.mesh);
+        const localPayload = parseEnvelopePayload(localManifest) as ManifestPayload;
+        localVersion = localPayload.version;
+      } catch {
+        localVersion = 0;
+      }
+
+      if (remoteHead.version <= localVersion) {
+        console.log(
+          `Manifest already up to date (local v${String(localVersion)}, remote v${String(remoteHead.version)}).`
+        );
+        return;
+      }
+
+      const remoteManifest = await fetchBootstrapManifest(
+        opts.seed,
+        meshKey,
+        remoteHead.version
+      );
+
+      const verified = verifyEnvelopeEd25519(remoteManifest, rootPublicKey);
+      if (!verified) {
+        throw new Error("Remote manifest signature verification failed");
+      }
+
+      const payload = parseEnvelopePayload(remoteManifest) as ManifestPayload;
+      if (payload.mesh !== opts.mesh) {
+        throw new Error(
+          `Manifest mesh mismatch: expected "${opts.mesh}" got "${payload.mesh}"`
+        );
+      }
+
+      saveManifest(opts.mesh, remoteManifest);
+      saveMeshKey(opts.mesh, payload.transport.meshKey);
+      saveConfig(manifestToConfig(payload));
+
+      console.log(`Synced manifest to version ${String(payload.version)}.`);
+    } catch (err) {
+      console.error(`Sync failed: ${String(err)}`);
+      process.exit(1);
+    }
   });
 
 // ─── meshbot serve ───

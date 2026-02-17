@@ -48,6 +48,7 @@ export async function startMcpServer(opts: ServeOptions): Promise<void> {
   try {
     httpServer = await startHttpServer({
       agentName: opts.agentName,
+      meshName: opts.meshName,
       port: opts.port,
       host: opts.host,
       meshKey,

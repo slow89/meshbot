@@ -27,6 +27,13 @@ export function createAuthMiddleware(
       return;
     }
 
+    // Some authenticated endpoints (e.g. bootstrap manifest/head)
+    // use GET and do not carry signed mesh message bodies.
+    if (req.method === "GET") {
+      next();
+      return;
+    }
+
     // Size check
     const contentLength = parseInt(
       req.headers["content-length"] ?? "0",

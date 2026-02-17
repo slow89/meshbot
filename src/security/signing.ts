@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import type { SignedEnvelope } from "../config/types.js";
 
 export interface SignableMessage {
   id: string;
@@ -74,4 +75,80 @@ export class NonceTracker {
 
 export function generateNonce(): string {
   return crypto.randomUUID();
+}
+
+function encodeBase64Url(input: Buffer): string {
+  return input.toString("base64url");
+}
+
+function decodeBase64Url(input: string): Buffer {
+  return Buffer.from(input, "base64url");
+}
+
+function canonicalizeValue(value: unknown): string {
+  if (value === null) return "null";
+
+  const valueType = typeof value;
+  if (valueType === "string") return JSON.stringify(value);
+  if (valueType === "boolean") return value ? "true" : "false";
+
+  if (valueType === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("Cannot canonicalize non-finite numbers");
+    }
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalizeValue(item)).join(",")}]`;
+  }
+
+  if (valueType === "object") {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort((a, b) => a.localeCompare(b));
+    const pairs = keys.map((key) => `${JSON.stringify(key)}:${canonicalizeValue(record[key])}`);
+    return `{${pairs.join(",")}}`;
+  }
+
+  throw new Error(`Cannot canonicalize value of type "${valueType}"`);
+}
+
+export function canonicalizeJson(value: unknown): string {
+  return canonicalizeValue(value);
+}
+
+export function signEnvelopeEd25519(
+  payload: unknown,
+  privateKeyPem: string,
+  kid: string
+): SignedEnvelope {
+  const payloadJson = canonicalizeJson(payload);
+  const payloadBytes = Buffer.from(payloadJson, "utf-8");
+  const signature = crypto.sign(null, payloadBytes, privateKeyPem);
+
+  return {
+    alg: "Ed25519",
+    kid,
+    payload: encodeBase64Url(payloadBytes),
+    sig: encodeBase64Url(signature),
+  };
+}
+
+export function verifyEnvelopeEd25519(
+  envelope: SignedEnvelope,
+  publicKeyPem: string
+): boolean {
+  try {
+    const payloadBytes = decodeBase64Url(envelope.payload);
+    const signature = decodeBase64Url(envelope.sig);
+    return crypto.verify(null, payloadBytes, publicKeyPem, signature);
+  } catch {
+    return false;
+  }
+}
+
+export function parseEnvelopePayload(envelope: SignedEnvelope): unknown {
+  const payloadBytes = decodeBase64Url(envelope.payload);
+  const payloadJson = payloadBytes.toString("utf-8");
+  return JSON.parse(payloadJson) as unknown;
 }
