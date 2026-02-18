@@ -52,23 +52,37 @@ export function verifyInviteToken(
     return { ok: false, error: "Malformed token" };
   }
 
+  let payloadBytes: Buffer;
+  let signature: Buffer;
   try {
-    const payloadBytes = decodeBase64Url(payloadPart);
-    const signature = decodeBase64Url(sigPart);
-    const validSignature = crypto.verify(null, payloadBytes, rootPublicKeyPem, signature);
-    if (!validSignature) {
-      return { ok: false, error: "Invalid token signature" };
-    }
-
-    const payloadUnknown = JSON.parse(payloadBytes.toString("utf-8")) as unknown;
-    if (!isInviteTokenPayload(payloadUnknown)) {
-      return { ok: false, error: "Invalid token payload" };
-    }
-
-    return { ok: true, payload: payloadUnknown };
+    payloadBytes = decodeBase64Url(payloadPart);
+    signature = decodeBase64Url(sigPart);
   } catch {
     return { ok: false, error: "Malformed token encoding" };
   }
+
+  let validSignature: boolean;
+  try {
+    validSignature = crypto.verify(null, payloadBytes, rootPublicKeyPem, signature);
+  } catch {
+    return { ok: false, error: "Invalid root public key format" };
+  }
+  if (!validSignature) {
+    return { ok: false, error: "Invalid token signature" };
+  }
+
+  let payloadUnknown: unknown;
+  try {
+    payloadUnknown = JSON.parse(payloadBytes.toString("utf-8")) as unknown;
+  } catch {
+    return { ok: false, error: "Malformed token payload JSON" };
+  }
+
+  if (!isInviteTokenPayload(payloadUnknown)) {
+    return { ok: false, error: "Invalid token payload" };
+  }
+
+  return { ok: true, payload: payloadUnknown };
 }
 
 export function parseDurationToMs(duration: string): number {

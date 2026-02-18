@@ -51,6 +51,27 @@ describe("invite tokens", () => {
     expect(verified.ok).toBe(false);
   });
 
+  it("returns a clear error for invalid root public key format", () => {
+    const { privateKeyPem } = generateSigningKeyPair();
+    const token = createInviteToken(
+      {
+        v: 1,
+        mesh: "test-mesh",
+        agent: "qa-bot",
+        nodePubKey: "node-public-key",
+        jti: "invite-invalid-key",
+        iat: Date.now(),
+        nbf: Date.now(),
+        exp: Date.now() + 60_000,
+      },
+      privateKeyPem
+    );
+
+    const verified = verifyInviteToken(token, "not-a-pem-key");
+    expect(verified.ok).toBe(false);
+    expect(verified.error).toContain("Invalid root public key format");
+  });
+
   it("round-trips optional seed hints and min manifest version", () => {
     const { privateKeyPem, publicKeyPem } = generateSigningKeyPair();
     const token = createInviteToken(

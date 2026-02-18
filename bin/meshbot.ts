@@ -308,6 +308,11 @@ program
       try {
         const nodePubKey = loadNodePublicKey(opts.mesh);
         const rootPublicKeyPem = fs.readFileSync(opts.rootPub, "utf-8").trim();
+        if (!rootPublicKeyPem.includes("BEGIN PUBLIC KEY")) {
+          throw new Error(
+            `--root-pub must point to the mesh root public key PEM (root.pub), not node.pub`
+          );
+        }
         const inviteVerification = verifyInviteToken(opts.invite, rootPublicKeyPem);
         if (!inviteVerification.ok || !inviteVerification.payload) {
           throw new Error(`Invalid invite token: ${inviteVerification.error ?? "verification failed"}`);
@@ -703,7 +708,7 @@ program
         process.on("SIGTERM", shutdown);
 
         // Keep process alive
-        await new Promise(() => {});
+        await new Promise(() => { });
       } else {
         // ── Interactive mode: launch the full Claude Code TUI ──
         // The serve subprocess launched via MCP config will auto-register normally.
