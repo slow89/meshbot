@@ -57,6 +57,82 @@ program
   .description("Cross-server Claude Code agent communication")
   .version("0.1.0");
 
+interface DaemonPidRecord {
+  pid: number;
+  mesh: string;
+  agent: string;
+  startedAt: number;
+  port: string;
+  host: string;
+}
+
+function getDaemonPidPath(meshName: string, agentName: string): string {
+  return path.join(os.homedir(), ".mesh", meshName, "daemons", `${agentName}.pid`);
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readDaemonPidRecord(meshName: string, agentName: string): DaemonPidRecord | undefined {
+  const pidPath = getDaemonPidPath(meshName, agentName);
+  if (!fs.existsSync(pidPath)) return undefined;
+
+  try {
+    const raw = fs.readFileSync(pidPath, "utf-8");
+    const parsed = JSON.parse(raw) as Partial<DaemonPidRecord>;
+    if (
+      typeof parsed.pid !== "number" ||
+      typeof parsed.mesh !== "string" ||
+      typeof parsed.agent !== "string"
+    ) {
+      return undefined;
+    }
+    return {
+      pid: parsed.pid,
+      mesh: parsed.mesh,
+      agent: parsed.agent,
+      startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : 0,
+      port: typeof parsed.port === "string" ? parsed.port : "0",
+      host: typeof parsed.host === "string" ? parsed.host : "0.0.0.0",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function writeDaemonPidRecord(record: DaemonPidRecord): void {
+  const pidPath = getDaemonPidPath(record.mesh, record.agent);
+  fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+  fs.writeFileSync(pidPath, JSON.stringify(record, null, 2) + "\n");
+}
+
+function removeDaemonPidFile(meshName: string, agentName: string): void {
+  const pidPath = getDaemonPidPath(meshName, agentName);
+  if (!fs.existsSync(pidPath)) return;
+  try {
+    fs.unlinkSync(pidPath);
+  } catch {
+    // best effort cleanup
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessRunning(pid)) {
+      return true;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+  return !isProcessRunning(pid);
+}
+
 function maybeUpdateManifestAfterConfigChange(meshName: string): void {
   try {
     const config = loadConfig(meshName);
@@ -228,6 +304,79 @@ program
     const key = loadRootPublicKey(opts.mesh);
     console.log(key);
   });
+
+program
+  .command("stop")
+  .description("Stop a running daemon for a specific agent")
+  .requiredOption("--as <name>", "Agent name for this daemon")
+  .option("-m, --mesh <meshName>", "Mesh name", "default")
+  .option("--signal <signal>", "Signal to send first (SIGTERM, SIGINT, SIGKILL)", "SIGTERM")
+  .option("--timeout <seconds>", "Wait before SIGKILL fallback", "8")
+  .action(
+    async (opts: { as: string; mesh: string; signal: string; timeout: string }) => {
+      const validSignals: NodeJS.Signals[] = ["SIGTERM", "SIGINT", "SIGKILL"];
+      const signal = opts.signal.toUpperCase() as NodeJS.Signals;
+      if (!validSignals.includes(signal)) {
+        console.error(
+          `Invalid signal "${opts.signal}". Use one of: ${validSignals.join(", ")}`
+        );
+        process.exit(1);
+      }
+
+      const timeoutSeconds = Number.parseInt(opts.timeout, 10);
+      if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) {
+        console.error(`Invalid timeout "${opts.timeout}". Use a non-negative integer.`);
+        process.exit(1);
+      }
+
+      const pidRecord = readDaemonPidRecord(opts.mesh, opts.as);
+      if (!pidRecord) {
+        console.error(`No daemon PID file found for "${opts.as}" in mesh "${opts.mesh}".`);
+        process.exit(1);
+      }
+
+      const pid = pidRecord.pid;
+      if (!isProcessRunning(pid)) {
+        removeDaemonPidFile(opts.mesh, opts.as);
+        console.log(
+          `Daemon "${opts.as}" is not running (stale PID file removed).`
+        );
+        return;
+      }
+
+      try {
+        process.kill(pid, signal);
+      } catch (err) {
+        console.error(`Failed to signal daemon: ${String(err)}`);
+        process.exit(1);
+      }
+
+      if (signal !== "SIGKILL") {
+        const exited = await waitForProcessExit(pid, timeoutSeconds * 1000);
+        if (!exited && isProcessRunning(pid)) {
+          console.log(
+            `Daemon "${opts.as}" did not exit after ${String(timeoutSeconds)}s, sending SIGKILL...`
+          );
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch (killErr) {
+            if (isProcessRunning(pid)) {
+              console.error(`Failed to SIGKILL daemon: ${String(killErr)}`);
+              process.exit(1);
+            }
+          }
+          const killed = await waitForProcessExit(pid, 2000);
+          if (!killed) {
+            console.error(`Daemon "${opts.as}" is still running (pid ${String(pid)}).`);
+            process.exit(1);
+          }
+        }
+      }
+
+      removeDaemonPidFile(opts.mesh, opts.as);
+      console.log(`Stopped daemon "${opts.as}" in mesh "${opts.mesh}".`);
+    }
+  );
 
 // ─── meshbot join-prepare ───
 program
@@ -592,6 +741,17 @@ program
       if (opts.daemon) {
         // ── Daemon mode: start HTTP listener, auto-process incoming messages with headless claude ──
         const fs = await import("node:fs");
+        const existingDaemon = readDaemonPidRecord(opts.mesh, opts.as);
+        if (existingDaemon) {
+          if (isProcessRunning(existingDaemon.pid)) {
+            console.error(
+              `Daemon "${opts.as}" is already running in mesh "${opts.mesh}" (pid ${String(existingDaemon.pid)}).`
+            );
+            console.error(`Stop it first with: meshbot stop --as ${opts.as} --mesh ${opts.mesh}`);
+            process.exit(1);
+          }
+          removeDaemonPidFile(opts.mesh, opts.as);
+        }
 
         // Build MCP config for the ephemeral `claude -p` subprocesses.
         // Use --no-register so they don't overwrite the primary agent's URL in config.
@@ -637,6 +797,22 @@ program
         console.log(`Agent "${opts.as}" listening at ${self?.url ?? "unknown"}`);
         console.log(`Daemon polling every ${opts.pollInterval}s for incoming messages...`);
         console.log(`Press Ctrl+C to stop.\n`);
+
+        writeDaemonPidRecord({
+          pid: process.pid,
+          mesh: opts.mesh,
+          agent: opts.as,
+          startedAt: Date.now(),
+          port: opts.port,
+          host: opts.host,
+        });
+        let pidFileRemoved = false;
+        const cleanupPidFile = () => {
+          if (pidFileRemoved) return;
+          removeDaemonPidFile(opts.mesh, opts.as);
+          pidFileRemoved = true;
+        };
+        process.on("exit", cleanupPidFile);
 
         const queueFile = path.join(
           os.homedir(), ".mesh", opts.mesh, "queues", opts.as, "queue.json"
@@ -713,6 +889,7 @@ program
           console.log("\nShutting down daemon...");
           clearInterval(interval);
           serveProc.kill();
+          cleanupPidFile();
           process.exit(0);
         };
         process.on("SIGINT", shutdown);

@@ -93,14 +93,21 @@ meshbot start --as prod-ops --daemon
 # prod-ops will automatically process it and reply
 ```
 
-### Multi-Server Setup
-
-Use this single flow. No directory `scp` required.
+Stop a specific daemon:
 
 ```bash
-# 1) On admin host (once): init + run a reachable seed agent
+meshbot stop --as prod-ops --mesh default
+```
+
+### Multi-Server Setup
+
+Use this single flow.
+
+```bash
+# 1) On admin host (once): init + register seed URL + run seed daemon
 meshbot init my-mesh
-meshbot start --as seed --mesh my-mesh --port 9820
+meshbot add-peer seed https://seed.example.com:9820 -m my-mesh
+meshbot start --as seed --mesh my-mesh --port 9820 --daemon
 ```
 
 ```bash
@@ -110,8 +117,9 @@ meshbot join-prepare --mesh my-mesh
 ```
 
 ```bash
-# 3) On admin host: create invite (embed seed hint) and print root public key
-meshbot invite create --mesh my-mesh --agent prod --node-pubkey <node-pub> --seed https://seed.example.com:9820 --ttl 15m
+# 3) On admin host: create invite and print root public key
+# invite auto-embeds seed hints from mesh peers
+meshbot invite create --mesh my-mesh --agent prod --node-pubkey <node-pub> --ttl 15m
 meshbot export-root-pub --mesh my-mesh
 ```
 
@@ -125,6 +133,7 @@ Key mapping:
 - `node.pub` is the host enrollment key created by `join-prepare`.
 - `root.pub` is the mesh trust key created by `init` on the admin host.
 - `join` requires `root.pub` (not `node.pub`).
+- `--seed` is optional and only needed as an override/debug escape hatch.
 
 ### Enabling HTTPS (TLS)
 
@@ -216,6 +225,7 @@ meshbot init <mesh-name> --legacy                 # Create only config + mesh.ke
 meshbot init <mesh-name> --no-bootstrap           # Alias for --legacy
 meshbot add-peer <name> <url> [-d "description"]  # Add peer
 meshbot remove-peer <name>                        # Remove peer
+meshbot stop --as <name> [-m <mesh-name>]         # Stop a specific daemon agent
 meshbot status                                    # Show all peers (online/offline)
 meshbot send <to> <message>                       # Manual message (debugging)
 meshbot export-key                                # Print mesh key
