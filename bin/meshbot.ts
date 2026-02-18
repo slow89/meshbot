@@ -18,6 +18,7 @@ import {
   addPeer,
   removePeer,
   loadRootPrivateKey,
+  loadRootPublicKey,
   saveRootPublicKey,
   saveNodePrivateKey,
   saveNodePublicKey,
@@ -219,6 +220,15 @@ program
     console.log(key);
   });
 
+program
+  .command("export-root-pub")
+  .description("Print the mesh root public key (PEM) to stdout")
+  .option("-m, --mesh <meshName>", "Mesh name", "default")
+  .action((opts: { mesh: string }) => {
+    const key = loadRootPublicKey(opts.mesh);
+    console.log(key);
+  });
+
 // ─── meshbot join-prepare ───
 program
   .command("join-prepare")
@@ -232,6 +242,7 @@ program
     console.log(`Generated node enrollment keys for mesh "${opts.mesh}".`);
     console.log(`Public key:  ~/.mesh/${opts.mesh}/node.pub`);
     console.log(`Private key: ~/.mesh/${opts.mesh}/node.key`);
+    console.log(`Note: this does not create root.pub. Get root.pub from the mesh init/admin host.`);
     console.log("\nGive this value to an admin for invite creation:");
     console.log(keyPair.publicKey);
   });

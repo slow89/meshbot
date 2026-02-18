@@ -95,50 +95,36 @@ meshbot start --as prod-ops --daemon
 
 ### Multi-Server Setup
 
-For agents on different servers, you can now bootstrap a new host without copying `~/.mesh/<mesh>/`.
+Use this single flow. No directory `scp` required.
 
 ```bash
-# On an existing mesh/admin host: initialize and register peer URLs
+# 1) On admin host (once): init + run a reachable seed agent
 meshbot init my-mesh
-meshbot add-peer prod-ops https://prod.internal:9820 -m my-mesh -d "Production monitoring"
-meshbot add-peer dev      https://dev.internal:9821  -m my-mesh -d "Development agent"
+meshbot start --as seed --mesh my-mesh --port 9820
 ```
 
 ```bash
-# On the NEW host (e.g. qa-bot host): generate enrollment keypair
+# 2) On NEW host: generate node keys
 meshbot join-prepare --mesh my-mesh
-# Copy printed node pubkey value to admin host
+# copy the printed node.pub value
 ```
 
 ```bash
-# Back on admin host: create short-lived invite for that node key
-meshbot invite create --mesh my-mesh --agent qa-bot --node-pubkey <node-pubkey> --ttl 15m
-# Copy token to new host
+# 3) On admin host: create invite (embed seed hint) and print root public key
+meshbot invite create --mesh my-mesh --agent prod --node-pubkey <node-pub> --seed https://seed.example.com:9820 --ttl 15m
+meshbot export-root-pub --mesh my-mesh
 ```
 
 ```bash
-# On the NEW host: join from any running seed peer
-meshbot join --mesh my-mesh --as qa-bot --invite <token> --root-pub ./my-mesh-root.pub
-meshbot start --as qa-bot --port 9822 --mesh my-mesh
+# 4) On NEW host: save the root public key text to a file, then join
+meshbot join --mesh my-mesh --as prod --invite <token> --root-pub ./root.pub
+meshbot start --as prod --mesh my-mesh --port 9821
 ```
 
-`--root-pub` should point to a trusted copy of the mesh root public key (`root.pub`).
-`meshbot join` uses seed hints from the invite token by default; pass `--seed <url>` to override.
-
-```bash
-# Existing hosts can pull newer signed manifest versions
-meshbot sync --mesh my-mesh --seed https://prod.internal:9820
-```
-
-```bash
-# On production server
-meshbot start --as prod-ops --port 9820 --mesh my-mesh
-
-# On dev server
-meshbot start --as dev --port 9821 --mesh my-mesh
-```
-
-> **Note**: On multi-server setups, `add-peer` with explicit URLs is needed because auto-registration uses `localhost`. Use fixed `--port` values so peers know where to find each other.
+Key mapping:
+- `node.pub` is the host enrollment key created by `join-prepare`.
+- `root.pub` is the mesh trust key created by `init` on the admin host.
+- `join` requires `root.pub` (not `node.pub`).
 
 ### Enabling HTTPS (TLS)
 
@@ -228,16 +214,25 @@ claude
 meshbot init <mesh-name>                          # Create mesh + key + bootstrap artifacts
 meshbot init <mesh-name> --legacy                 # Create only config + mesh.key
 meshbot init <mesh-name> --no-bootstrap           # Alias for --legacy
-meshbot join-prepare [-m <mesh-name>]             # Generate node enrollment keypair
-meshbot invite create --agent <name> --node-pubkey <base64> [-m <mesh-name>] [--ttl 15m] [--seed <url>...]
-meshbot join --as <name> --invite <token> --root-pub <path> [-m <mesh-name>] [--seed <url>]
-meshbot sync --seed <url> [-m <mesh-name>]        # Pull newer signed manifest/config
 meshbot add-peer <name> <url> [-d "description"]  # Add peer
 meshbot remove-peer <name>                        # Remove peer
 meshbot status                                    # Show all peers (online/offline)
 meshbot send <to> <message>                       # Manual message (debugging)
 meshbot export-key                                # Print mesh key
 ```
+
+### Advanced Bootstrap Commands
+
+Use these only for multi-host bootstrap and mesh updates.
+
+| Command | What it does | Why/When you need it |
+|---|---|---|
+| `meshbot join-prepare` | Creates host enrollment keys (`node.pub`, `node.key`) | Run once on a new host before it joins a mesh |
+| `meshbot invite create ...` | Creates signed short-lived join token | Required on admin host to authorize a specific new host/agent |
+| `meshbot export-root-pub` | Prints mesh trust key (`root.pub`) | Needed so new hosts can verify manifest signatures during `join` |
+| `meshbot join ...` | Joins mesh using invite + root trust key | Run on new host to enroll without copying entire mesh directory |
+| `meshbot sync ...` | Pulls newer signed manifest/config from a peer | Use for manual refreshes or cron-based config updates |
+| `meshbot init --legacy` | Disables bootstrap artifacts | Compatibility mode for old pre-bootstrap workflow |
 
 ## MCP Tools
 
