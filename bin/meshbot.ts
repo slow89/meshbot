@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
+import { createInterface, type Interface as ReadlineInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { generateEnrollmentKeyPair, generateMeshKey } from "../src/security/keys.js";
 import {
@@ -23,6 +24,7 @@ import {
   saveNodePrivateKey,
   saveNodePublicKey,
   loadNodePublicKey,
+  getNodePublicKeyPath,
   saveManifest,
   loadManifest,
   getRootPublicKeyPath,
@@ -33,6 +35,7 @@ import {
   joinMeshBootstrap,
   fetchBootstrapHead,
   fetchBootstrapManifest,
+  normalizePeerUrl,
 } from "../src/client/mesh-client.js";
 import {
   manifestToConfig,
@@ -144,6 +147,237 @@ function maybeUpdateManifestAfterConfigChange(meshName: string): void {
   }
 }
 
+function expandHomePath(inputPath: string): string {
+  if (inputPath === "~") return os.homedir();
+  if (inputPath.startsWith("~/")) {
+    return path.join(os.homedir(), inputPath.slice(2));
+  }
+  return inputPath;
+}
+
+function unwrapQuotedValue(value: string): string {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function sanitizeInviteToken(value: string): string {
+  return unwrapQuotedValue(value).replace(/\s+/g, "");
+}
+
+function ensureBootstrapArtifacts(meshName: string): { createdRootKeys: boolean; createdManifest: boolean } {
+  const config = loadConfig(meshName);
+  const meshKey = loadMeshKey(meshName);
+
+  let createdRootKeys = false;
+  try {
+    loadRootPrivateKey(meshName);
+    loadRootPublicKey(meshName);
+  } catch {
+    setupBootstrapArtifacts(config, meshKey);
+    createdRootKeys = true;
+  }
+
+  let createdManifest = false;
+  try {
+    loadManifest(meshName);
+  } catch {
+    updateSignedManifest(config, meshKey);
+    createdManifest = true;
+  }
+
+  return { createdRootKeys, createdManifest };
+}
+
+function detectDefaultSeedAddress(port: string): string {
+  const interfaces = os.networkInterfaces();
+  for (const addresses of Object.values(interfaces)) {
+    if (!addresses) continue;
+    for (const addr of addresses) {
+      if (addr.family === "IPv4" && !addr.internal) {
+        return `${addr.address}:${port}`;
+      }
+    }
+  }
+  return `127.0.0.1:${port}`;
+}
+
+function parsePortFromUrlOrHost(value: string): string | undefined {
+  try {
+    const normalized = normalizePeerUrl(value);
+    const parsed = new URL(normalized);
+    if (parsed.port) return parsed.port;
+  } catch {
+    // ignore parse failures and fall back to defaults
+  }
+  return undefined;
+}
+
+function createPromptInterface(): ReadlineInterface {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("This command requires an interactive terminal.");
+  }
+  return createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+}
+
+async function promptText(
+  rl: ReadlineInterface,
+  label: string,
+  defaultValue?: string
+): Promise<string> {
+  const suffix = defaultValue ? ` [${defaultValue}]` : "";
+  const answer = (await rl.question(`${label}${suffix}: `)).trim();
+  if (answer.length === 0 && defaultValue !== undefined) return defaultValue;
+  return answer;
+}
+
+async function promptRequiredText(
+  rl: ReadlineInterface,
+  label: string,
+  defaultValue?: string
+): Promise<string> {
+  while (true) {
+    const value = await promptText(rl, label, defaultValue);
+    if (value.trim().length > 0) return value.trim();
+    console.log("Value cannot be empty.");
+  }
+}
+
+async function promptYesNo(
+  rl: ReadlineInterface,
+  label: string,
+  defaultYes: boolean
+): Promise<boolean> {
+  const hint = defaultYes ? "Y/n" : "y/N";
+  const answer = (await rl.question(`${label} [${hint}]: `)).trim().toLowerCase();
+  if (answer.length === 0) return defaultYes;
+  return answer === "y" || answer === "yes";
+}
+
+function resolveSelfCommand(runArgs: string[]): { command: string; args: string[] } {
+  const entrypoint = process.argv[1];
+  if (!entrypoint) {
+    return { command: "meshbot", args: runArgs };
+  }
+  if (entrypoint.endsWith(".js")) {
+    return { command: "node", args: [entrypoint, ...runArgs] };
+  }
+  if (entrypoint.endsWith(".ts")) {
+    return { command: "pnpm", args: ["tsx", entrypoint, ...runArgs] };
+  }
+  return { command: "meshbot", args: runArgs };
+}
+
+function startDetachedMeshbot(args: string[]): void {
+  const cmd = resolveSelfCommand(args);
+  const child = spawn(cmd.command, cmd.args, {
+    detached: true,
+    stdio: "ignore",
+    env: process.env,
+  });
+  child.unref();
+}
+
+interface JoinOptions {
+  as: string;
+  seed?: string;
+  invite: string;
+  rootPub: string;
+  mesh: string;
+}
+
+async function performJoin(opts: JoinOptions): Promise<void> {
+  const nodePubKey = loadNodePublicKey(opts.mesh);
+  const rootPubPath = expandHomePath(opts.rootPub);
+  const rootPublicKeyPem = fs.readFileSync(rootPubPath, "utf-8").trim();
+  if (!rootPublicKeyPem.includes("BEGIN PUBLIC KEY")) {
+    throw new Error(
+      `--root-pub must point to the mesh root public key PEM (root.pub), not node.pub`
+    );
+  }
+
+  const inviteToken = sanitizeInviteToken(opts.invite);
+  const inviteVerification = verifyInviteToken(inviteToken, rootPublicKeyPem);
+  if (!inviteVerification.ok || !inviteVerification.payload) {
+    throw new Error(`Invalid invite token: ${inviteVerification.error ?? "verification failed"}`);
+  }
+  if (inviteVerification.payload.mesh !== opts.mesh) {
+    throw new Error(
+      `Invite mesh mismatch: expected "${opts.mesh}" got "${inviteVerification.payload.mesh}"`
+    );
+  }
+
+  const seedCandidates = opts.seed
+    ? [normalizePeerUrl(opts.seed)]
+    : (inviteVerification.payload.seedHints ?? []).map((seed) => normalizePeerUrl(seed));
+  if (seedCandidates.length === 0) {
+    throw new Error(
+      "No seed URL provided. Pass --seed or create an invite with seed hints."
+    );
+  }
+
+  let joinResponse: Awaited<ReturnType<typeof joinMeshBootstrap>> | undefined;
+  let selectedSeed: string | undefined;
+  const joinErrors: string[] = [];
+  for (const candidate of [...new Set(seedCandidates)]) {
+    try {
+      joinResponse = await joinMeshBootstrap(
+        candidate,
+        inviteToken,
+        nodePubKey
+      );
+      selectedSeed = candidate;
+      break;
+    } catch (err) {
+      joinErrors.push(`${candidate}: ${String(err)}`);
+    }
+  }
+
+  if (!joinResponse || !selectedSeed) {
+    throw new Error(`Failed to join using all seed candidates. ${joinErrors.join(" | ")}`);
+  }
+  if (!opts.seed) {
+    console.log(`Using seed from invite token: ${selectedSeed}`);
+  }
+  const manifestEnvelope = joinResponse.manifest;
+
+  const verified = verifyEnvelopeEd25519(manifestEnvelope, rootPublicKeyPem);
+  if (!verified) {
+    throw new Error("Manifest signature verification failed");
+  }
+
+  const manifestPayload = parseEnvelopePayload(manifestEnvelope) as ManifestPayload;
+  if (manifestPayload.mesh !== opts.mesh) {
+    throw new Error(
+      `Manifest mesh mismatch: expected "${opts.mesh}" got "${manifestPayload.mesh}"`
+    );
+  }
+  if (!manifestPayload.agents[opts.as]) {
+    console.error(
+      `Warning: agent "${opts.as}" is not listed in manifest peers yet.`
+    );
+  }
+
+  saveRootPublicKey(opts.mesh, rootPublicKeyPem);
+  saveManifest(opts.mesh, manifestEnvelope);
+  saveMeshKey(opts.mesh, manifestPayload.transport.meshKey);
+  saveConfig(manifestToConfig(manifestPayload));
+
+  console.log(`Joined mesh "${opts.mesh}" from seed ${selectedSeed}.`);
+  console.log(`Manifest version: ${String(manifestPayload.version)}`);
+  console.log(`Saved config: ~/.mesh/${opts.mesh}/config.json`);
+  console.log(`Saved key:    ~/.mesh/${opts.mesh}/mesh.key`);
+  console.log(`\nNext: meshbot start --as ${opts.as} --mesh ${opts.mesh}`);
+}
+
 // ─── meshbot init <mesh-name> ───
 program
   .command("init <meshName>")
@@ -188,15 +422,21 @@ program
 // ─── meshbot add-peer <name> <url> ───
 program
   .command("add-peer <name> <url>")
-  .description("Add a peer agent to the mesh config")
+  .description("Add a peer agent to the mesh config (url can be ip:port or full URL)")
   .option("-m, --mesh <meshName>", "Mesh name", "default")
   .option("-d, --description <desc>", "Agent description")
   .action((name: string, url: string, opts: { mesh: string; description?: string }) => {
-    const config = loadConfig(opts.mesh);
-    const updated = addPeer(config, name, url, opts.description);
-    saveConfig(updated);
-    maybeUpdateManifestAfterConfigChange(opts.mesh);
-    console.log(`Added peer "${name}" (${url}) to mesh "${opts.mesh}".`);
+    try {
+      const normalizedUrl = normalizePeerUrl(url);
+      const config = loadConfig(opts.mesh);
+      const updated = addPeer(config, name, normalizedUrl, opts.description);
+      saveConfig(updated);
+      maybeUpdateManifestAfterConfigChange(opts.mesh);
+      console.log(`Added peer "${name}" (${normalizedUrl}) to mesh "${opts.mesh}".`);
+    } catch (err) {
+      console.error(`Failed to add peer: ${String(err)}`);
+      process.exit(1);
+    }
   });
 
 // ─── meshbot remove-peer <name> ───
@@ -414,8 +654,8 @@ inviteCommand
     const now = Date.now();
     const config = loadConfig(opts.mesh);
     const seedHints = (opts.seed && opts.seed.length > 0)
-      ? opts.seed
-      : Object.values(config.peers).map((peer) => peer.url).slice(0, 5);
+      ? opts.seed.map((seed) => normalizePeerUrl(seed))
+      : Object.values(config.peers).map((peer) => normalizePeerUrl(peer.url)).slice(0, 5);
 
     let minManifestVersion: number | undefined;
     try {
@@ -453,7 +693,7 @@ program
   .command("join")
   .description("Join a mesh by fetching a signed manifest from a seed peer")
   .requiredOption("--as <name>", "Agent name for this host")
-  .option("--seed <url>", "Bootstrap seed peer URL (optional if invite includes seed hints)")
+  .option("--seed <url>", "Bootstrap seed peer URL or ip:port (optional if invite includes seed hints)")
   .requiredOption("--invite <token>", "Invite token from `meshbot invite create`")
   .requiredOption("--root-pub <path>", "Path to root public key PEM")
   .option("-m, --mesh <meshName>", "Mesh name", "default")
@@ -466,84 +706,7 @@ program
       mesh: string;
     }) => {
       try {
-        const nodePubKey = loadNodePublicKey(opts.mesh);
-        const rootPublicKeyPem = fs.readFileSync(opts.rootPub, "utf-8").trim();
-        if (!rootPublicKeyPem.includes("BEGIN PUBLIC KEY")) {
-          throw new Error(
-            `--root-pub must point to the mesh root public key PEM (root.pub), not node.pub`
-          );
-        }
-        const inviteVerification = verifyInviteToken(opts.invite, rootPublicKeyPem);
-        if (!inviteVerification.ok || !inviteVerification.payload) {
-          throw new Error(`Invalid invite token: ${inviteVerification.error ?? "verification failed"}`);
-        }
-        if (inviteVerification.payload.mesh !== opts.mesh) {
-          throw new Error(
-            `Invite mesh mismatch: expected "${opts.mesh}" got "${inviteVerification.payload.mesh}"`
-          );
-        }
-
-        const seedCandidates = opts.seed
-          ? [opts.seed]
-          : (inviteVerification.payload.seedHints ?? []);
-        if (seedCandidates.length === 0) {
-          throw new Error(
-            "No seed URL provided. Pass --seed or create an invite with seed hints."
-          );
-        }
-
-        let joinResponse: Awaited<ReturnType<typeof joinMeshBootstrap>> | undefined;
-        let selectedSeed: string | undefined;
-        const joinErrors: string[] = [];
-        for (const candidate of seedCandidates) {
-          try {
-            joinResponse = await joinMeshBootstrap(
-              candidate,
-              opts.invite,
-              nodePubKey
-            );
-            selectedSeed = candidate;
-            break;
-          } catch (err) {
-            joinErrors.push(`${candidate}: ${String(err)}`);
-          }
-        }
-
-        if (!joinResponse || !selectedSeed) {
-          throw new Error(`Failed to join using all seed candidates. ${joinErrors.join(" | ")}`);
-        }
-        if (!opts.seed) {
-          console.log(`Using seed from invite token: ${selectedSeed}`);
-        }
-        const manifestEnvelope = joinResponse.manifest;
-
-        const verified = verifyEnvelopeEd25519(manifestEnvelope, rootPublicKeyPem);
-        if (!verified) {
-          throw new Error("Manifest signature verification failed");
-        }
-
-        const manifestPayload = parseEnvelopePayload(manifestEnvelope) as ManifestPayload;
-        if (manifestPayload.mesh !== opts.mesh) {
-          throw new Error(
-            `Manifest mesh mismatch: expected "${opts.mesh}" got "${manifestPayload.mesh}"`
-          );
-        }
-        if (!manifestPayload.agents[opts.as]) {
-          console.error(
-            `Warning: agent "${opts.as}" is not listed in manifest peers yet.`
-          );
-        }
-
-        saveRootPublicKey(opts.mesh, rootPublicKeyPem);
-        saveManifest(opts.mesh, manifestEnvelope);
-        saveMeshKey(opts.mesh, manifestPayload.transport.meshKey);
-        saveConfig(manifestToConfig(manifestPayload));
-
-        console.log(`Joined mesh "${opts.mesh}" from seed ${selectedSeed}.`);
-        console.log(`Manifest version: ${String(manifestPayload.version)}`);
-        console.log(`Saved config: ~/.mesh/${opts.mesh}/config.json`);
-        console.log(`Saved key:    ~/.mesh/${opts.mesh}/mesh.key`);
-        console.log(`\nNext: meshbot start --as ${opts.as} --mesh ${opts.mesh}`);
+        await performJoin(opts);
       } catch (err) {
         console.error(`Join failed: ${String(err)}`);
         process.exit(1);
@@ -551,11 +714,205 @@ program
     }
   );
 
+async function runWizardAdmin(): Promise<void> {
+  let rl: ReadlineInterface | undefined;
+  try {
+    rl = createPromptInterface();
+    const meshName = await promptRequiredText(rl, "Mesh name", "default");
+    const seedAgent = await promptRequiredText(rl, "Seed agent name", "seed");
+    const defaultPort = "9820";
+    const defaultSeedAddress = detectDefaultSeedAddress(defaultPort);
+    const seedAddress = await promptRequiredText(
+      rl,
+      "Seed address other hosts should use (ip:port or URL)",
+      defaultSeedAddress
+    );
+    const detectedPort = parsePortFromUrlOrHost(seedAddress) ?? defaultPort;
+    const seedPort = await promptRequiredText(rl, "Seed daemon port", detectedPort);
+    const seedHost = await promptRequiredText(rl, "Seed daemon listen host", "0.0.0.0");
+    const startDaemonNow = await promptYesNo(rl, "Start seed daemon now", true);
+    rl.close();
+    rl = undefined;
+
+    const seedUrl = new URL(normalizePeerUrl(seedAddress));
+    if (!seedUrl.port) {
+      seedUrl.port = seedPort;
+    }
+    const normalizedSeedUrl = seedUrl.toString().replace(/\/$/, "");
+
+    if (!meshExists(meshName)) {
+      const key = generateMeshKey();
+      saveMeshKey(meshName, key);
+      const config = createDefaultConfig(meshName);
+      saveConfig(config);
+      const bootstrap = setupBootstrapArtifacts(config, key);
+      console.log(`Created mesh "${meshName}" with bootstrap artifacts.`);
+      console.log(`Root public key:  ${bootstrap.rootPublicKeyPath}`);
+      console.log(`Root private key: ${bootstrap.rootPrivateKeyPath}`);
+    } else {
+      const bootstrap = ensureBootstrapArtifacts(meshName);
+      if (bootstrap.createdRootKeys) {
+        console.log(`Generated bootstrap root keys for existing mesh "${meshName}".`);
+      } else if (bootstrap.createdManifest) {
+        console.log(`Generated signed manifest for existing mesh "${meshName}".`);
+      }
+    }
+
+    const config = loadConfig(meshName);
+    const description = config.peers[seedAgent]?.description ?? "Bootstrap seed";
+    const updated = addPeer(config, seedAgent, normalizedSeedUrl, description);
+    saveConfig(updated);
+    maybeUpdateManifestAfterConfigChange(meshName);
+
+    console.log(`Configured seed peer "${seedAgent}" at ${normalizedSeedUrl}.`);
+    if (startDaemonNow) {
+      const existing = readDaemonPidRecord(meshName, seedAgent);
+      if (existing && isProcessRunning(existing.pid)) {
+        console.log(
+          `Daemon "${seedAgent}" is already running in mesh "${meshName}" (pid ${String(existing.pid)}).`
+        );
+      } else {
+        if (existing) {
+          removeDaemonPidFile(meshName, seedAgent);
+        }
+        startDetachedMeshbot([
+          "start",
+          "--as",
+          seedAgent,
+          "--mesh",
+          meshName,
+          "--port",
+          seedPort,
+          "--host",
+          seedHost,
+          "--daemon",
+        ]);
+        console.log(`Started "${seedAgent}" daemon in background.`);
+      }
+    } else {
+      console.log(
+        `Start it when ready: meshbot start --as ${seedAgent} --mesh ${meshName} --port ${seedPort} --host ${seedHost} --daemon`
+      );
+    }
+
+    console.log("\nNext on a new host:");
+    console.log("  meshbot wizard join");
+    console.log("Then run on this admin host when prompted:");
+    console.log(
+      `  meshbot invite create --mesh ${meshName} --agent <new-agent> --node-pubkey <node-pub> --ttl 15m`
+    );
+    console.log(`  meshbot export-root-pub --mesh ${meshName}`);
+  } catch (err) {
+    if (rl) rl.close();
+    console.error(`wizard-admin failed: ${String(err)}`);
+    process.exit(1);
+  }
+}
+
+async function runWizardJoin(): Promise<void> {
+  let rl: ReadlineInterface | undefined;
+  try {
+    rl = createPromptInterface();
+    const meshName = await promptRequiredText(rl, "Mesh name", "default");
+    const defaultAgent = os.hostname().split(".")[0] || "agent";
+    const agentName = await promptRequiredText(rl, "Agent name for this host", defaultAgent);
+
+    const nodePubPath = getNodePublicKeyPath(meshName);
+    const hasNodeKey = fs.existsSync(nodePubPath);
+    let nodePubKey: string;
+    if (hasNodeKey) {
+      const reuse = await promptYesNo(rl, "Reuse existing node enrollment key", true);
+      if (reuse) {
+        nodePubKey = loadNodePublicKey(meshName);
+      } else {
+        const keyPair = generateEnrollmentKeyPair();
+        saveNodePublicKey(meshName, keyPair.publicKey);
+        saveNodePrivateKey(meshName, keyPair.privateKey);
+        nodePubKey = keyPair.publicKey;
+      }
+    } else {
+      const keyPair = generateEnrollmentKeyPair();
+      saveNodePublicKey(meshName, keyPair.publicKey);
+      saveNodePrivateKey(meshName, keyPair.privateKey);
+      nodePubKey = keyPair.publicKey;
+    }
+
+    console.log(`\nNode public key (${nodePubPath}):`);
+    console.log(nodePubKey);
+    console.log("\nSend this to the admin host and request:");
+    console.log(
+      `  meshbot invite create --mesh ${meshName} --agent ${agentName} --node-pubkey <above-node-pub> --ttl 15m`
+    );
+    console.log(`  meshbot export-root-pub --mesh ${meshName}`);
+
+    const continueToJoin = await promptYesNo(rl, "Do you already have invite token + root.pub", false);
+    if (!continueToJoin) {
+      console.log("\nRun this command again after you receive the invite token and root public key.");
+      rl.close();
+      return;
+    }
+
+    const inviteToken = await promptRequiredText(rl, "Paste invite token");
+    const rootPubPathInput = await promptRequiredText(
+      rl,
+      "Path to root public key PEM (root.pub)",
+      `~/.mesh/${meshName}/root.pub`
+    );
+    const seedOverrideRaw = await promptText(
+      rl,
+      "Optional seed override (ip:port or URL; press Enter to skip)"
+    );
+    rl.close();
+    rl = undefined;
+
+    const rootPubPath = expandHomePath(rootPubPathInput);
+    if (!fs.existsSync(rootPubPath)) {
+      throw new Error(`Root public key file not found: ${rootPubPath}`);
+    }
+
+    await performJoin({
+      as: agentName,
+      mesh: meshName,
+      invite: inviteToken,
+      rootPub: rootPubPath,
+      seed: seedOverrideRaw.trim().length > 0 ? seedOverrideRaw : undefined,
+    });
+  } catch (err) {
+    if (rl) rl.close();
+    console.error(`wizard-join failed: ${String(err)}`);
+    process.exit(1);
+  }
+}
+
+const wizardCommand = program
+  .command("wizard")
+  .description("Interactive setup wizards for multi-host bootstrap");
+
+wizardCommand
+  .command("admin")
+  .description("Interactive setup for an admin/seed host")
+  .action(runWizardAdmin);
+
+wizardCommand
+  .command("join")
+  .description("Interactive setup for a new host joining a mesh")
+  .action(runWizardJoin);
+
+program
+  .command("wizard-admin")
+  .description("Interactive setup for an admin/seed host (alias for `wizard admin`)")
+  .action(runWizardAdmin);
+
+program
+  .command("wizard-join")
+  .description("Interactive setup for a new host joining a mesh (alias for `wizard join`)")
+  .action(runWizardJoin);
+
 // ─── meshbot sync ───
 program
   .command("sync")
   .description("Sync signed manifest from a seed peer")
-  .requiredOption("--seed <url>", "Seed peer URL")
+  .requiredOption("--seed <url>", "Seed peer URL or ip:port")
   .option("-m, --mesh <meshName>", "Mesh name", "default")
   .action(async (opts: { seed: string; mesh: string }) => {
     try {

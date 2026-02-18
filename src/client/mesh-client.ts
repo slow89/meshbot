@@ -56,7 +56,7 @@ export async function sendMeshMessage(
 ): Promise<{ success: boolean; messageId: string; data?: unknown }> {
   const msg = buildMessage(opts);
   const endpoint = endpointForType(opts.type);
-  const url = `${opts.peerUrl.replace(/\/$/, "")}${endpoint}`;
+  const url = `${normalizePeerUrl(opts.peerUrl)}${endpoint}`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -86,7 +86,7 @@ export async function checkPeerHealth(
   timestamp?: number;
 }> {
   try {
-    const url = `${peerUrl.replace(/\/$/, "")}/mesh/health`;
+    const url = `${normalizePeerUrl(peerUrl)}/mesh/health`;
     const response = await fetch(url, {
       signal: AbortSignal.timeout(5000),
     });
@@ -119,8 +119,16 @@ export interface BootstrapJoinResponse {
   };
 }
 
-function normalizeUrl(peerUrl: string): string {
-  return peerUrl.replace(/\/$/, "");
+const URL_SCHEME_RE = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//;
+
+export function normalizePeerUrl(peerUrl: string): string {
+  const trimmed = peerUrl.trim();
+  if (trimmed.length === 0) {
+    throw new Error("Peer URL cannot be empty");
+  }
+
+  const withScheme = URL_SCHEME_RE.test(trimmed) ? trimmed : `http://${trimmed}`;
+  return withScheme.replace(/\/+$/, "");
 }
 
 export async function joinMeshBootstrap(
@@ -128,7 +136,7 @@ export async function joinMeshBootstrap(
   token: string,
   nodePubKey: string
 ): Promise<BootstrapJoinResponse> {
-  const url = `${normalizeUrl(peerUrl)}/mesh/bootstrap/join`;
+  const url = `${normalizePeerUrl(peerUrl)}/mesh/bootstrap/join`;
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -147,7 +155,7 @@ export async function fetchBootstrapHead(
   peerUrl: string,
   meshKey: string
 ): Promise<BootstrapHead> {
-  const url = `${normalizeUrl(peerUrl)}/mesh/bootstrap/head`;
+  const url = `${normalizePeerUrl(peerUrl)}/mesh/bootstrap/head`;
   const response = await fetch(url, {
     headers: {
       Authorization: `Bearer ${meshKey}`,
@@ -167,7 +175,7 @@ export async function fetchBootstrapManifest(
   meshKey: string,
   version: number | "latest"
 ): Promise<SignedEnvelope> {
-  const url = `${normalizeUrl(peerUrl)}/mesh/bootstrap/manifest/${String(version)}`;
+  const url = `${normalizePeerUrl(peerUrl)}/mesh/bootstrap/manifest/${String(version)}`;
   const response = await fetch(url, {
     headers: {
       Authorization: `Bearer ${meshKey}`,

@@ -101,39 +101,30 @@ meshbot stop --as prod-ops --mesh default
 
 ### Multi-Server Setup
 
-Use this single flow.
+Use the wizards. `--seed` is optional in normal setup and only needed as a manual override.
 
 ```bash
-# 1) On admin host (once): init + register seed URL + run seed daemon
-meshbot init my-mesh
-meshbot add-peer seed https://seed.example.com:9820 -m my-mesh
-meshbot start --as seed --mesh my-mesh --port 9820 --daemon
+# 1) On admin host (once)
+meshbot wizard admin
 ```
 
 ```bash
-# 2) On NEW host: generate node keys
-meshbot join-prepare --mesh my-mesh
-# copy the printed node.pub value
+# 2) On each new host
+meshbot wizard join
 ```
 
-```bash
-# 3) On admin host: create invite and print root public key
-# invite auto-embeds seed hints from mesh peers
-meshbot invite create --mesh my-mesh --agent prod --node-pubkey <node-pub> --ttl 15m
-meshbot export-root-pub --mesh my-mesh
-```
-
-```bash
-# 4) On NEW host: save the root public key text to a file, then join
-meshbot join --mesh my-mesh --as prod --invite <token> --root-pub ./root.pub
-meshbot start --as prod --mesh my-mesh --port 9821
-```
+`wizard join` prints the node public key and exact admin commands for creating an invite token + sharing `root.pub`.  
+Run `wizard join` again after you receive those values to complete enrollment.
 
 Key mapping:
-- `node.pub` is the host enrollment key created by `join-prepare`.
-- `root.pub` is the mesh trust key created by `init` on the admin host.
+- `node.pub` is the host enrollment key created on the new host.
+- `root.pub` is the mesh trust key created on the admin host.
 - `join` requires `root.pub` (not `node.pub`).
 - `--seed` is optional and only needed as an override/debug escape hatch.
+
+URL shortcut:
+- `add-peer`, `invite create --seed`, `join --seed`, and `sync --seed` accept `ip:port` or full URL.
+- If you pass `ip:port`, meshbot automatically treats it as `http://ip:port`.
 
 ### Enabling HTTPS (TLS)
 
@@ -223,6 +214,10 @@ claude
 meshbot init <mesh-name>                          # Create mesh + key + bootstrap artifacts
 meshbot init <mesh-name> --legacy                 # Create only config + mesh.key
 meshbot init <mesh-name> --no-bootstrap           # Alias for --legacy
+meshbot wizard admin                              # Interactive admin/seed setup
+meshbot wizard join                               # Interactive new-host enrollment
+meshbot wizard-admin                              # Alias for wizard admin
+meshbot wizard-join                               # Alias for wizard join
 meshbot add-peer <name> <url> [-d "description"]  # Add peer
 meshbot remove-peer <name>                        # Remove peer
 meshbot stop --as <name> [-m <mesh-name>]         # Stop a specific daemon agent
@@ -233,7 +228,7 @@ meshbot export-key                                # Print mesh key
 
 ### Advanced Bootstrap Commands
 
-Use these only for multi-host bootstrap and mesh updates.
+Use these when you want manual control beyond the wizards.
 
 | Command | What it does | Why/When you need it |
 |---|---|---|
