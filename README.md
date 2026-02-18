@@ -113,7 +113,8 @@ meshbot wizard admin
 meshbot wizard join
 ```
 
-`wizard join` prints the node public key and exact admin commands for creating an invite token + sharing `root.pub`.  
+`wizard join` prints prefilled admin commands (including the full `--node-pubkey` value) for creating an invite token + sharing `root.pub`.  
+When clipboard tooling is available, it also copies those commands for quick paste on the admin host.  
 Run `wizard join` again after you receive those values to complete enrollment.
 
 Key mapping:

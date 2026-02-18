@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -284,6 +284,38 @@ function startDetachedMeshbot(args: string[]): void {
     env: process.env,
   });
   child.unref();
+}
+
+function shellQuote(value: string): string {
+  if (value.length === 0) return "''";
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function tryCopyToClipboard(text: string): { ok: boolean; method?: string } {
+  const attempts: Array<{ command: string; args?: string[] }> = [];
+  if (process.platform === "darwin") {
+    attempts.push({ command: "pbcopy" });
+  } else if (process.platform === "win32") {
+    attempts.push({ command: "clip" });
+  } else {
+    attempts.push(
+      { command: "wl-copy" },
+      { command: "xclip", args: ["-selection", "clipboard"] },
+      { command: "xsel", args: ["--clipboard", "--input"] }
+    );
+  }
+
+  for (const attempt of attempts) {
+    const result = spawnSync(attempt.command, attempt.args ?? [], {
+      input: text,
+      encoding: "utf-8",
+    });
+    if (!result.error && result.status === 0) {
+      return { ok: true, method: attempt.command };
+    }
+  }
+
+  return { ok: false };
 }
 
 interface JoinOptions {
@@ -839,11 +871,25 @@ async function runWizardJoin(): Promise<void> {
 
     console.log(`\nNode public key (${nodePubPath}):`);
     console.log(nodePubKey);
-    console.log("\nSend this to the admin host and request:");
-    console.log(
-      `  meshbot invite create --mesh ${meshName} --agent ${agentName} --node-pubkey <above-node-pub> --ttl 15m`
-    );
-    console.log(`  meshbot export-root-pub --mesh ${meshName}`);
+    const inviteCreateCommand = [
+      "meshbot invite create",
+      `--mesh ${shellQuote(meshName)}`,
+      `--agent ${shellQuote(agentName)}`,
+      `--node-pubkey ${shellQuote(nodePubKey)}`,
+      "--ttl 15m",
+    ].join(" ");
+    const exportRootPubCommand = `meshbot export-root-pub --mesh ${shellQuote(meshName)}`;
+    const adminCommandSnippet = `${inviteCreateCommand}\n${exportRootPubCommand}`;
+
+    console.log("\nRun these on the admin host:");
+    console.log(`  ${inviteCreateCommand}`);
+    console.log(`  ${exportRootPubCommand}`);
+    const clipboard = tryCopyToClipboard(adminCommandSnippet);
+    if (clipboard.ok) {
+      console.log(`(Copied both admin commands to clipboard via ${clipboard.method}.)`);
+    } else {
+      console.log("(Clipboard copy unavailable in this environment.)");
+    }
 
     const continueToJoin = await promptYesNo(rl, "Do you already have invite token + root.pub", false);
     if (!continueToJoin) {
